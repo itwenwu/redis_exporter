@@ -81,7 +81,6 @@ var (
 		"used_memory_rss":     "memory_used_rss_bytes",
 		"used_memory_peak":    "memory_used_peak_bytes",
 		"used_memory_lua":     "memory_used_lua_bytes",
-		"total_system_memory": "total_system_memory_bytes",
 		"maxmemory":           "memory_max_bytes",
 
 		// # Persistence
@@ -339,6 +338,10 @@ func NewRedisExporter(hosts []RedisHost, opts *Options) (*Exporter, error) {
 		return &e, fmt.Errorf("Couldn't parse check-single-keys: %#v", err)
 	}
 	log.Debugf("singleKeys: %#v", e.singleKeys)
+
+	if opts.IncludeVerbotenMetrics {
+		metricMap["total_system_memory"] = "total_system_memory_bytes"
+	}
 
 	e.initGauges()
 	return &e, nil
