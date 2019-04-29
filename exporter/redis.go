@@ -16,11 +16,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// RedisHost represents a set of Redis Hosts to health check.
 type RedisHost struct {
-	Addrs     []string
-	Passwords []string
-	Aliases   []string
+	Addr     string
+	Password string
+	Alias    string
 }
 
 type dbKeyPair struct {
@@ -34,7 +33,7 @@ type keyInfo struct {
 
 // Exporter implements the prometheus.Exporter interface, and exports Redis metrics.
 type Exporter struct {
-	redis        RedisHost
+	hosts        []RedisHost
 	namespace    string
 	keys         []dbKeyPair
 	singleKeys   []dbKeyPair
@@ -45,6 +44,8 @@ type Exporter struct {
 	scrapeErrors prometheus.Gauge
 	totalScrapes prometheus.Counter
 	metrics      map[string]*prometheus.GaugeVec
+
+	options Options
 
 	LuaScript []byte
 
@@ -282,40 +283,46 @@ func parseKeyArg(keysArgString string) (keys []dbKeyPair, err error) {
 	return keys, err
 }
 
+type Options struct {
+	Namespace              string
+	CheckSingleKeys        string
+	CheckKeys              string
+	IncludeVerbotenMetrics bool
+}
+
 // NewRedisExporter returns a new exporter of Redis metrics.
 // note to self: next time we add an argument, instead add a RedisExporter struct
-func NewRedisExporter(host RedisHost, namespace, checkSingleKeys, checkKeys string) (*Exporter, error) {
-
+func NewRedisExporter(hosts []RedisHost, opts *Options) (*Exporter, error) {
 	e := Exporter{
-		redis:     host,
-		namespace: namespace,
+		hosts:     hosts,
+		namespace: opts.Namespace,
 		keyValues: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
+			Namespace: opts.Namespace,
 			Name:      "key_value",
 			Help:      "The value of \"key\"",
 		}, []string{"addr", "alias", "db", "key"}),
 		keySizes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
+			Namespace: opts.Namespace,
 			Name:      "key_size",
 			Help:      "The length or size of \"key\"",
 		}, []string{"addr", "alias", "db", "key"}),
 		scriptValues: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: namespace,
+			Namespace: opts.Namespace,
 			Name:      "script_value",
 			Help:      "Values returned by the collect script",
 		}, []string{"addr", "alias", "key"}),
 		duration: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
+			Namespace: opts.Namespace,
 			Name:      "exporter_last_scrape_duration_seconds",
 			Help:      "The last scrape duration.",
 		}),
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
+			Namespace: opts.Namespace,
 			Name:      "exporter_scrapes_total",
 			Help:      "Current total redis scrapes.",
 		}),
 		scrapeErrors: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
+			Namespace: opts.Namespace,
 			Name:      "exporter_last_scrape_error",
 			Help:      "The last scrape error status.",
 		}),
@@ -323,12 +330,12 @@ func NewRedisExporter(host RedisHost, namespace, checkSingleKeys, checkKeys stri
 
 	var err error
 
-	if e.keys, err = parseKeyArg(checkKeys); err != nil {
+	if e.keys, err = parseKeyArg(opts.CheckKeys); err != nil {
 		return &e, fmt.Errorf("Couldn't parse check-keys: %#v", err)
 	}
 	log.Debugf("keys: %#v", e.keys)
 
-	if e.singleKeys, err = parseKeyArg(checkSingleKeys); err != nil {
+	if e.singleKeys, err = parseKeyArg(opts.CheckSingleKeys); err != nil {
 		return &e, fmt.Errorf("Couldn't parse check-single-keys: %#v", err)
 	}
 	log.Debugf("singleKeys: %#v", e.singleKeys)
@@ -864,43 +871,43 @@ func getKeysFromPatterns(c redis.Conn, keys []dbKeyPair) (expandedKeys []dbKeyPa
 	return expandedKeys, err
 }
 
-func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx int) error {
+func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, host RedisHost) error {
 	options := []redis.DialOption{
 		redis.DialConnectTimeout(5 * time.Second),
 		redis.DialReadTimeout(5 * time.Second),
 		redis.DialWriteTimeout(5 * time.Second),
 	}
 
-	if len(e.redis.Passwords) > idx && e.redis.Passwords[idx] != "" {
-		options = append(options, redis.DialPassword(e.redis.Passwords[idx]))
+	if host.Password != "" {
+		options = append(options, redis.DialPassword(host.Password))
 	}
 
-	log.Debugf("Trying DialURL(): %s", addr)
-	c, err := redis.DialURL(addr, options...)
+	log.Debugf("Trying DialURL(): %s", host.Addr)
+	c, err := redis.DialURL(host.Addr, options...)
 
 	if err != nil {
 		log.Debugf("DialURL() failed, err: %s", err)
-		if frags := strings.Split(addr, "://"); len(frags) == 2 {
+		if frags := strings.Split(host.Addr, "://"); len(frags) == 2 {
 			log.Debugf("Trying: Dial(): %s %s", frags[0], frags[1])
 			c, err = redis.Dial(frags[0], frags[1], options...)
 		} else {
-			log.Debugf("Trying: Dial(): tcp %s", addr)
-			c, err = redis.Dial("tcp", addr, options...)
+			log.Debugf("Trying: Dial(): tcp %s", host.Addr)
+			c, err = redis.Dial("tcp", host.Addr, options...)
 		}
 	}
 
 	if err != nil {
-		log.Debugf("aborting for addr: %s - redis err: %s", addr, err)
+		log.Debugf("aborting for addr: %s - redis err: %s", host.Addr, err)
 		return err
 	}
 
 	defer c.Close()
-	log.Debugf("connected to: %s", addr)
+	log.Debugf("connected to: %s", host.Addr)
 
 	dbCount := 0
 
 	if config, err := redis.Strings(c.Do("CONFIG", "GET", "*")); err == nil {
-		dbCount, err = extractConfigMetrics(config, addr, e.redis.Aliases[idx], scrapes)
+		dbCount, err = extractConfigMetrics(config, host.Addr, host.Alias, scrapes)
 		if err != nil {
 			log.Errorf("Redis CONFIG err: %s", err)
 			return err
@@ -921,7 +928,7 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 
 	if isClusterEnabled {
 		if clusterInfo, err := redis.String(doRedisCmd(c, "CLUSTER", "INFO")); err == nil {
-			e.extractClusterInfoMetrics(clusterInfo, addr, e.redis.Aliases[idx], scrapes)
+			e.extractClusterInfoMetrics(clusterInfo, host.Addr, host.Alias, scrapes)
 
 			// in cluster mode Redis only supports one database so no extra padding beyond that needed
 			dbCount = 1
@@ -936,12 +943,12 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 		}
 	}
 
-	e.extractInfoMetrics(infoAll, addr, e.redis.Aliases[idx], scrapes, dbCount)
+	e.extractInfoMetrics(infoAll, host.Addr, host.Alias, scrapes, dbCount)
 
 	// SERVER command only works on tile38 database. check the following link to
 	// find out more: https://tile38.com/
 	if serverInfo, err := redis.Strings(doRedisCmd(c, "SERVER")); err == nil {
-		e.extractTile38Metrics(serverInfo, addr, e.redis.Aliases[idx], scrapes)
+		e.extractTile38Metrics(serverInfo, host.Addr, host.Alias, scrapes)
 	} else {
 		log.Debugf("Tile38 SERVER err: %s", err)
 	}
@@ -953,8 +960,8 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 			latencyResult := tempVal[0].([]interface{})
 			if _, err := redis.Scan(latencyResult, &eventName, &spikeLast, &milliseconds, &max); err == nil {
 				e.metricsMtx.RLock()
-				e.metrics["latency_spike_last"].WithLabelValues(addr, e.redis.Aliases[idx], eventName).Set(float64(spikeLast))
-				e.metrics["latency_spike_milliseconds"].WithLabelValues(addr, e.redis.Aliases[idx], eventName).Set(float64(milliseconds))
+				e.metrics["latency_spike_last"].WithLabelValues(host.Addr, host.Alias, eventName).Set(float64(spikeLast))
+				e.metrics["latency_spike_milliseconds"].WithLabelValues(host.Addr, host.Alias, eventName).Set(float64(milliseconds))
 				e.metricsMtx.RUnlock()
 			}
 		}
@@ -989,11 +996,11 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 			continue
 		}
 		dbLabel := "db" + k.db
-		e.keySizes.WithLabelValues(addr, e.redis.Aliases[idx], dbLabel, k.key).Set(info.size)
+		e.keySizes.WithLabelValues(host.Addr, host.Alias, dbLabel, k.key).Set(info.size)
 
 		// Only record value metric if value is float-y
 		if value, err := redis.Float64(c.Do("GET", k.key)); err == nil {
-			e.keyValues.WithLabelValues(addr, e.redis.Aliases[idx], dbLabel, k.key).Set(value)
+			e.keyValues.WithLabelValues(host.Addr, host.Alias, dbLabel, k.key).Set(value)
 		}
 	}
 
@@ -1005,7 +1012,7 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 		} else if kv != nil {
 			for key, stringVal := range kv {
 				if val, err := strconv.ParseFloat(stringVal, 64); err == nil {
-					e.scriptValues.WithLabelValues(addr, e.redis.Aliases[idx], key).Set(val)
+					e.scriptValues.WithLabelValues(host.Addr, host.Alias, key).Set(val)
 				}
 			}
 		}
@@ -1013,7 +1020,7 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 
 	if reply, err := c.Do("SLOWLOG", "LEN"); err == nil {
 		e.metricsMtx.RLock()
-		e.metrics["slowlog_length"].WithLabelValues(addr, e.redis.Aliases[idx]).Set(float64(reply.(int64)))
+		e.metrics["slowlog_length"].WithLabelValues(host.Addr, host.Alias).Set(float64(reply.(int64)))
 		e.metricsMtx.RUnlock()
 	}
 
@@ -1031,8 +1038,8 @@ func (e *Exporter) scrapeRedisHost(scrapes chan<- scrapeResult, addr string, idx
 		}
 
 		e.metricsMtx.RLock()
-		e.metrics["slowlog_last_id"].WithLabelValues(addr, e.redis.Aliases[idx]).Set(float64(slowlogLastId))
-		e.metrics["last_slow_execution_duration_seconds"].WithLabelValues(addr, e.redis.Aliases[idx]).Set(lastSlowExecutionDurationSeconds)
+		e.metrics["slowlog_last_id"].WithLabelValues(host.Addr, host.Alias).Set(float64(slowlogLastId))
+		e.metrics["last_slow_execution_duration_seconds"].WithLabelValues(host.Addr, host.Alias).Set(lastSlowExecutionDurationSeconds)
 		e.metricsMtx.RUnlock()
 	}
 
@@ -1047,13 +1054,13 @@ func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
 	e.totalScrapes.Inc()
 
 	errorCount := 0
-	for idx, addr := range e.redis.Addrs {
+	for _, host := range e.hosts {
 		var up float64 = 1
-		if err := e.scrapeRedisHost(scrapes, addr, idx); err != nil {
+		if err := e.scrapeRedisHost(scrapes, host); err != nil {
 			errorCount++
 			up = 0
 		}
-		scrapes <- scrapeResult{Name: "up", Addr: addr, Alias: e.redis.Aliases[idx], Value: up}
+		scrapes <- scrapeResult{Name: "up", Addr: host.Addr, Alias: host.Alias, Value: up}
 	}
 
 	e.scrapeErrors.Set(float64(errorCount))
